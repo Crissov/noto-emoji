@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # Copyright 2016 Google Inc. All rights reserved.
 #
@@ -23,15 +23,19 @@ builds an html page presenting the images along with their composition
 import argparse
 import codecs
 import collections
+import datetime
 import glob
 import os
 from os import path
 import re
 import shutil
+import string
 import sys
 
 from nototools import tool_utils
 from nototools import unicode_data
+
+import add_aliases
 
 _default_dir = 'png/128'
 _default_ext = 'png'
@@ -53,44 +57,64 @@ def _merge_keys(dicts):
     keys.extend(d.keys())
   return frozenset(keys)
 
-def _generate_row_cells(key, canonical_key, font, dir_infos, basepaths, colors):
+
+def _generate_row_cells(
+    key, font, aliases, excluded, dir_infos, basepaths, colors):
   CELL_PREFIX = '<td>'
   indices = range(len(basepaths))
-  def _cell(key, info, basepath):
+  def _cell(info, basepath):
     if key in info.filemap:
-      return '<img src="%s">' % path.join(
-          basepath, info.filemap[key])
-    return '-missing-'
-  def _text_cell(key, text_dir):
-    text = ''.join(unichr(cp) for cp in canonical_key)
+      return '<img src="%s">' % path.join(basepath, info.filemap[key])
+    if key in aliases:
+      return 'alias'
+    if key in excluded:
+      return 'exclude'
+    return 'missing'
+
+  def _text_cell(text_dir):
+    text = ''.join(unichr(cp) for cp in key)
     return '<span class="efont" dir="%s">%s</span>' % (text_dir, text)
 
   if font:
     row_cells = [
-        CELL_PREFIX + _text_cell(key, text_dir)
+        CELL_PREFIX + _text_cell(text_dir)
         for text_dir in ('ltr', 'rtl')]
   else:
     row_cells = []
   row_cells.extend(
-      [CELL_PREFIX + _cell(key, dir_infos[i], basepaths[i])
+      [CELL_PREFIX + _cell(dir_infos[i], basepaths[i])
        for i in indices])
   if len(colors) > 1:
     ix = indices[-1]
-    extension = CELL_PREFIX + _cell(key, dir_infos[ix], basepaths[ix])
+    extension = CELL_PREFIX + _cell(dir_infos[ix], basepaths[ix])
     row_cells.extend([extension] * (len(colors) - 1))
   return row_cells
 
 
-def _get_desc(key_tuple, dir_infos, basepaths):
+def _get_desc(key_tuple, aliases, dir_infos, basepaths):
   CELL_PREFIX = '<td>'
   def _get_filepath(cp):
+    def get_key_filepath(key):
+      for i in range(len(dir_infos)):
+        info = dir_infos[i]
+        if key in info.filemap:
+          basepath = basepaths[i]
+          return path.join(basepath, info.filemap[key])
+      return None
+
     cp_key = tuple([cp])
-    for i in range(len(dir_infos)):
-      info = dir_infos[i]
-      if cp_key in info.filemap:
-        basepath = basepaths[i]
-        return path.join(basepath, info.filemap[cp_key])
-    return None
+    cp_key = unicode_data.get_canonical_emoji_sequence(cp_key) or cp_key
+    fp = get_key_filepath(cp_key)
+    if not fp:
+      if cp_key in aliases:
+        fp = get_key_filepath(aliases[cp_key])
+      else:
+        print 'no alias for %s' % unicode_data.seq_to_string(cp_key)
+    if not fp:
+      print 'no part for %s in %s' % (
+          unicode_data.seq_to_string(cp_key),
+          unicode_data.seq_to_string(key_tuple))
+    return fp
 
   def _get_part(cp):
     if cp == 0x200d:  # zwj, common so replace with '+'
@@ -117,10 +141,10 @@ def _get_desc(key_tuple, dir_infos, basepaths):
   return CELL_PREFIX + desc
 
 
-def _get_name(key_tuple, annotated_tuples):
+def _get_name(key_tuple, annotations):
+  annotation = None if annotations is None else annotations.get(key_tuple)
   CELL_PREFIX = '<td%s>' % (
-      '' if annotated_tuples is None or key_tuple not in annotated_tuples
-      else ' class="aname"')
+      '' if annotation is None else ' class="%s"' % annotation)
 
   seq_name = unicode_data.get_emoji_sequence_name(key_tuple)
   if seq_name == None:
@@ -134,17 +158,17 @@ def _get_name(key_tuple, annotated_tuples):
   return CELL_PREFIX + seq_name
 
 
-def _collect_aux_info(dir_infos, all_keys):
+def _collect_aux_info(dir_infos, keys):
   """Returns a map from dir_info_index to a set of keys of additional images
   that we will take from the directory at that index."""
 
   target_key_to_info_index = {}
-  for key in all_keys:
+  for key in keys:
     if len(key) == 1:
       continue
     for cp in key:
       target_key = tuple([cp])
-      if target_key in all_keys or target_key in target_key_to_info_index:
+      if target_key in keys or target_key in target_key_to_info_index:
         continue
       for i, info in enumerate(dir_infos):
         if target_key in info.filemap:
@@ -163,18 +187,21 @@ def _collect_aux_info(dir_infos, all_keys):
 
 
 def _generate_content(
-    basedir, font, dir_infos, limit, annotate, standalone, colors):
-  """Generate an html table for the infos.  basedir is the parent directory
-  of the content, filenames will be made relative to this if underneath it,
-  else absolute. If limit is true and there are multiple dirs, limit the set of
-  sequences to those in the first dir.  If font is not none, generate columns
-  for the text rendered in the font before other columns.  if annotate is
-  not none, highlight sequences that appear in this set."""
-
-  if len(dir_infos) == 1 or limit:
-    all_keys = frozenset(dir_infos[0].filemap.keys())
-  else:
-    all_keys = _merge_keys([info.filemap for info in dir_infos])
+    basedir, font, dir_infos, keys, aliases, excluded, annotations, standalone,
+    colors):
+  """Generate an html table for the infos.  Basedir is the parent directory of
+  the content, filenames will be made relative to this if underneath it, else
+  absolute. If font is not none, generate columns for the text rendered in the
+  font before other columns.  Dir_infos is the list of DirInfos in column
+  order.  Keys is the list of canonical emoji sequences in row order.  Aliases
+  and excluded indicate images we expect to not be present either because
+  they are aliased or specifically excluded.  If annotations is not none,
+  highlight sequences that appear in this map based on their map values ('ok',
+  'error', 'warning').  If standalone is true, the image data and font (if used)
+  will be copied under the basedir to make a completely stand-alone page.
+  Colors is the list of background colors, the last DirInfo column will be
+  repeated against each of these backgrounds.
+  """
 
   basedir = path.abspath(path.expanduser(basedir))
   if not path.isdir(basedir):
@@ -187,7 +214,7 @@ def _generate_content(
     # aren't part of main set.  e.g. if we have female basketball player
     # color-3 we want female, basketball player, and color-3 images available
     # even if they aren't part of the target set.
-    aux_info = _collect_aux_info(dir_infos, all_keys)
+    aux_info = _collect_aux_info(dir_infos, keys)
 
     # create image subdirectories in target dir, copy image files to them,
     # and adjust paths
@@ -197,8 +224,7 @@ def _generate_content(
       if not path.isdir(dstdir):
         os.mkdir(dstdir)
 
-      aux_keys = aux_info[i]
-      copy_keys = all_keys if not aux_keys else (all_keys | aux_keys)
+      copy_keys = set(keys) | aux_info[i]
       srcdir = info.directory
       filemap = info.filemap
       for key in copy_keys:
@@ -229,26 +255,18 @@ def _generate_content(
   header_row.extend(['Sequence', 'Name'])
   lines.append('<th>'.join(header_row))
 
-  for key in sorted(all_keys):
-    row = []
-    canonical_key = unicode_data.get_canonical_emoji_sequence(key)
-    if not canonical_key:
-      canonical_key = key
+  for key in keys:
+    row = _generate_row_cells(
+        key, font, aliases, excluded, dir_infos, basepaths, colors)
+    row.append(_get_desc(key, aliases, dir_infos, basepaths))
+    row.append(_get_name(key, annotations))
+    lines.append(''.join(row))
 
-    row.extend(
-        _generate_row_cells(
-            key, canonical_key, font, dir_infos, basepaths, colors))
-    row.append(_get_desc(canonical_key, dir_infos, basepaths))
-    row.append(_get_name(canonical_key, annotate))
-    try:
-      lines.append(''.join(row))
-    except:
-      raise Exception('couldn\'t decode %s' % row)
   return '\n  <tr>'.join(lines) + '\n</table>'
 
 
 def _get_image_data(image_dir, ext, prefix):
-  """Return a map from a tuple of cp sequences to a filename.
+  """Return a map from a canonical tuple of cp sequences to a filename.
 
   This filters by file extension, and expects the rest of the files
   to match the prefix followed by a sequence of hex codepoints separated
@@ -267,18 +285,23 @@ def _get_image_data(image_dir, ext, prefix):
       fails.append('"%s" did not match: "%s"' % (expect_re.pattern, filename))
       continue
     seq = m.group(1)
+    this_failed = False
     try:
       cps = tuple(int(s, 16) for s in seq.split('_'))
+      for cp in cps:
+        if (cp > 0x10ffff):
+          fails.append('cp out of range: ' + filename)
+          this_failed = True
+          break
+      if this_failed:
+        continue
+      canonical_cps = unicode_data.get_canonical_emoji_sequence(cps)
+      if canonical_cps:
+        # if it is unrecognized, just leave it alone, else replace with
+        # canonical sequence.
+        cps = canonical_cps
     except:
       fails.append('bad cp sequence: ' + filename)
-      continue
-    this_failed = False
-    for cp in cps:
-      if (cp > 0x10ffff):
-        fails.append('cp out of range: ' + filename)
-        this_failed = True
-        break
-    if this_failed:
       continue
     if cps in result:
       fails.append('duplicate sequence: %s and %s' (result[cps], filename))
@@ -327,49 +350,124 @@ def _get_dir_infos(
   return infos
 
 
+def _add_aliases(keys, aliases):
+  for k, v in sorted(aliases.iteritems()):
+    k_str = unicode_data.seq_to_string(k)
+    v_str = unicode_data.seq_to_string(v)
+    if k in keys:
+      msg = '' if v in keys else ' but it\'s not present'
+      print 'have alias image %s, should use %s%s' % (k_str, v_str, msg)
+    elif v not in keys:
+      print 'can\'t use alias %s, no image matching %s' % (k_str, v_str)
+  to_add = {k for k, v in aliases.iteritems() if k not in keys and v in keys}
+  return keys | to_add
+
+
+def _get_keys(dir_infos, aliases, limit, all_emoji, emoji_sort, ignore_missing):
+  """Return a list of the key tuples to display.  If all_emoji is
+  true, start with all emoji sequences, else the sequences available
+  in dir_infos (limited to the first dir_info if limit is True).
+  If ignore_missing is true and all_emoji is false, ignore sequences
+  that are not valid (e.g. skin tone variants of wrestlers).  If
+  ignore_missing is true and all_emoji is true, ignore sequences
+  for which we have no assets (e.g. newly defined emoji).  If not using
+  all_emoji, aliases are included if we have a target for them.
+  The result is in emoji order if emoji_sort is true, else in
+  unicode codepoint order."""
+
+  if all_emoji or ignore_missing:
+    all_keys = unicode_data.get_emoji_sequences()
+  if not all_emoji or ignore_missing:
+    if len(dir_infos) == 1 or limit:
+      avail_keys = frozenset(dir_infos[0].filemap.keys())
+    else:
+      avail_keys = _merge_keys([info.filemap for info in dir_infos])
+    if aliases:
+      avail_keys = _add_aliases(avail_keys, aliases)
+
+  if not ignore_missing:
+    keys = all_keys if all_emoji else avail_keys
+  else:
+    keys = set(all_keys) & avail_keys
+
+  if emoji_sort:
+    sorted_keys = unicode_data.get_sorted_emoji_sequences(keys)
+  else:
+    sorted_keys = sorted(keys)
+  return sorted_keys
+
+
+def _generate_info_text(args):
+  lines = ['%s: %r' % t for t in sorted(args.__dict__.iteritems())]
+  lines.append('generated by %s on %s' % (
+      path.basename(__file__), datetime.datetime.now()))
+  return '\n  '.join(lines)
+
+
 def _parse_annotation_file(afile):
-  annotations = set()
-  line_re = re.compile(r'([0-9a-f ]+)')
+  """Parse file and return a map from sequences to one of 'ok', 'warning',
+  or 'error'.
+
+  The file format consists of two kinds of lines.  One defines the annotation
+  to apply, it consists of the text 'annotation:' followed by one of 'ok',
+  'warning', or 'error'.  The other defines a sequence that should get the most
+  recently defined annotation, this is a series of codepoints expressed in hex
+  separated by spaces.  The initial default annotation is 'error'.  '#' starts
+  a comment to end of line, blank lines are ignored.
+  """
+
+  annotations = {}
+  line_re = re.compile(r'annotation:\s*(ok|warning|error)|([0-9a-f ]+)')
+  annotation = 'error'
   with open(afile, 'r') as f:
     for line in f:
       line = line.strip()
       if not line or line[0] == '#':
         continue
       m = line_re.match(line)
-      if m:
-        annotations.add(tuple([int(s, 16) for s in m.group(1).split()]))
-  return frozenset(annotations)
+      if not m:
+        raise Exception('could not parse annotation "%s"' % line)
+      new_annotation = m.group(1)
+      if new_annotation:
+        annotation = new_annotation
+      else:
+        seq = tuple([int(s, 16) for s in m.group(2).split()])
+        canonical_seq = unicode_data.get_canonical_emoji_sequence(seq)
+        if canonical_seq:
+          seq = canonical_seq
+        if seq in annotations:
+          raise Exception(
+              'duplicate sequence %s in annotations' %
+              unicode_data.seq_to_string(seq))
+        annotations[seq] = annotation
+  return annotations
 
 
 def _instantiate_template(template, arg_dict):
-  id_regex = re.compile('{{([a-zA-Z0-9_]+)}}')
+  id_regex = re.compile(r'\$([a-zA-Z0-9_]+)')
   ids = set(m.group(1) for m in id_regex.finditer(template))
   keyset = set(arg_dict.keys())
-  missing_ids = ids - keyset
   extra_args = keyset - ids
   if extra_args:
     print >> sys.stderr, (
         'the following %d args are unused:\n%s' %
         (len(extra_args), ', '.join(sorted(extra_args))))
-  text = template
-  if missing_ids:
-    raise ValueError(
-        'the following %d ids in the template have no args:\n%s' %
-        (len(missing_ids), ', '.join(sorted(missing_ids))))
-  for arg in ids:
-    text = re.sub('{{%s}}' % arg, arg_dict[arg], text)
-  return text
+  return string.Template(template).substitute(arg_dict)
 
 
 TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>{{title}}</title>{{fontFaceStyle}}
-    <style>{{style}}</style>
+    <title>$title</title>$fontFaceStyle
+    <style>$style</style>
   </head>
   <body>
-  {{content}}
+  <!--
+  $info
+  -->
+  <h3>$title</h3>
+  $content
   </body>
 </html>
 """
@@ -385,12 +483,14 @@ STYLE = """
          vertical-align: bottom; width: 32px; height: 32px
       }
       td:last-of-type { background-color: white }
-      td.aname { background-color: rgb(250, 65, 75) }
+      td.error { background-color: rgb(250, 65, 75) }
+      td.warning { background-color: rgb(240, 245, 50) }
+      td.ok { background-color: rgb(10, 200, 60) }
 """
 
 def write_html_page(
-    filename, page_title, font, dir_infos, limit, annotate, standalone,
-    colors):
+    filename, page_title, font, dir_infos, keys, aliases, excluded, annotations,
+    standalone, colors, info):
 
   out_dir = path.dirname(filename)
   if font:
@@ -415,13 +515,13 @@ def write_html_page(
         font = path.normpath(path.join(common_prefix, rel_font))
 
   content = _generate_content(
-      path.dirname(filename), font, dir_infos, limit, annotate, standalone,
-      colors)
+      path.dirname(filename), font, dir_infos, keys, aliases, excluded,
+      annotations, standalone, colors)
   N_STYLE = STYLE
   if font:
     FONT_FACE_STYLE = """
     <style>@font-face {
-      font-family: "Emoji"; src: url("%s");
+      font-family: "Emoji"; src: local("Noto Color Emoji"), url("%s");
     }</style>""" % font
     N_STYLE += '      span.efont { font-family: "Emoji"; font-size:32pt }\n'
   else:
@@ -436,9 +536,22 @@ def write_html_page(
   text = _instantiate_template(
       TEMPLATE, {
           'title': page_title, 'fontFaceStyle': FONT_FACE_STYLE,
-          'style': N_STYLE, 'content': content})
+          'style': N_STYLE, 'content': content, 'info':info})
   with codecs.open(filename, 'w', 'utf-8') as f:
     f.write(text)
+
+
+def _get_canonical_aliases():
+  def canon(seq):
+    return unicode_data.get_canonical_emoji_sequence(seq) or seq
+  aliases = add_aliases.read_default_emoji_aliases()
+  return {canon(k): canon(v) for k, v in aliases.iteritems()}
+
+def _get_canonical_excluded():
+  def canon(seq):
+    return unicode_data.get_canonical_emoji_sequence(seq) or seq
+  aliases = add_aliases.read_default_unknown_flag_aliases()
+  return frozenset([canon(k) for k in aliases.keys()])
 
 
 def main():
@@ -480,6 +593,13 @@ def main():
   parser.add_argument(
       '-c', '--colors', help='list of colors for background', nargs='*',
       metavar='hex')
+  parser.add_argument(
+      '--all_emoji', help='use all emoji sequences', action='store_true')
+  parser.add_argument(
+      '--emoji_sort', help='use emoji sort order', action='store_true')
+  parser.add_argument(
+      '--ignore_missing', help='do not include missing emoji',
+      action='store_true')
 
   args = parser.parse_args()
   file_parts = path.splitext(args.outfile)
@@ -502,10 +622,19 @@ def main():
       args.image_dirs, args.exts, args.prefixes, args.titles,
       args.default_ext, args.default_prefix)
 
+  aliases = _get_canonical_aliases()
+  keys = _get_keys(
+      dir_infos, aliases, args.limit, args.all_emoji, args.emoji_sort,
+      args.ignore_missing)
+
+  excluded = _get_canonical_excluded()
+
+  info = _generate_info_text(args)
+
   write_html_page(
-      args.outfile, args.page_title, args.font, dir_infos, args.limit,
-      annotations, args.standalone, args.colors)
+      args.outfile, args.page_title, args.font, dir_infos, keys, aliases,
+      excluded, annotations, args.standalone, args.colors, info)
 
 
 if __name__ == "__main__":
-    main()
+  main()
